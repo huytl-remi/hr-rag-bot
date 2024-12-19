@@ -1,232 +1,306 @@
-import streamlit as st
-from openai import OpenAI
-import tempfile
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
+from contextlib import asynccontextmanager
 import os
+import logging
 import time
-from typing import Dict, List
+from datetime import datetime
+from dotenv import load_dotenv
+from bot import Bot
 
-# Load the OpenAI API key securely from Streamlit secrets
-OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+load_dotenv(override=True)
 
-class RAGBot:
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s - %(pathname)s:%(lineno)d'
+)
+logger = logging.getLogger(__name__)
+
+# Load env variables
+bot_token = os.getenv("SLACK_BOT_TOKEN")
+signing_secret = os.getenv("SLACK_SIGNING_SECRET")
+openai_key = os.getenv("OPENAI_API_KEY")
+assistant_id = os.getenv("OPENAI_ASSISTANT_ID")
+
+# Validate required env vars
+required_vars = {
+    "SLACK_BOT_TOKEN": bot_token,
+    "SLACK_SIGNING_SECRET": signing_secret,
+    "OPENAI_API_KEY": openai_key,
+    "OPENAI_ASSISTANT_ID": assistant_id
+}
+
+missing_vars = [var for var, value in required_vars.items() if not value]
+if missing_vars:
+    raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+class AppState:
     def __init__(self):
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
-        self.init_session_state()
+        self.start_time: float = time.time()
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_error: Optional[str] = None
+        self.bot: Optional[Bot] = None
 
-    def init_session_state(self):
-        """Initialize session state variables."""
-        default_state = {
-            "messages": [],
-            "assistant": None,
-            "vector_store_id": None,
-            "thread_id": None,
-        }
-        for key, value in default_state.items():
-            if key not in st.session_state:
-                st.session_state[key] = value
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Proper async initialization of bot with type checking"""
+    try:
+        # Startup
+        logger.info("Starting up...")
+        app.state.metrics = AppState()
 
-    def create_vector_store(self) -> str:
-        """Create a new vector store for file search."""
-        try:
-            vector_store = self.client.beta.vector_stores.create(name="HR Docs Vector Store")
-            st.session_state.vector_store_id = vector_store.id
-            return vector_store.id
-        except Exception as e:
-            st.error(f"Failed to create vector store: {str(e)}")
-            return None
+        # Add type checking for env vars
+        if not isinstance(openai_key, str) or not isinstance(assistant_id, str):
+            raise ValueError("API key and assistant ID must be strings")
 
-    def upload_files_to_vector_store(self, file_paths: List[str]) -> bool:
-        """Uploads files to the vector store and polls for completion."""
-        vector_store_id = st.session_state.vector_store_id
-        if not vector_store_id:
-            st.error("Vector store ID not found.")
-            return False
-
-        file_streams = []
-        try:
-            for file_path in file_paths:
-                file_streams.append(open(file_path, "rb"))
-
-            file_batch = self.client.beta.vector_stores.file_batches.upload_and_poll(
-                vector_store_id=vector_store_id, files=file_streams
-            )
-            return file_batch.status == "completed"
-        except Exception as e:
-            st.error(f"File upload failed: {str(e)}")
-            return False
-        finally:
-            # Close and delete temporary files
-            for fs in file_streams:
-                fs.close()
-                os.unlink(fs.name)
-
-    def create_assistant(self) -> str:
-        """Creates an assistant linked to the vector store if not already created."""
-        if st.session_state.assistant:
-            return st.session_state.assistant
-
-        if not st.session_state.vector_store_id:
-            st.error("Vector store not available. Upload files first.")
-            return None
-
-        try:
-            assistant = self.client.beta.assistants.create(
-                name="HR Assistant",
-                description="Answers HR-related questions based on uploaded documents",
-                model="gpt-4o-mini",
-                instructions="Provide helpful responses without repeating the question.",
-                tools=[{"type": "file_search"}],
-                tool_resources={"file_search": {"vector_store_ids": [st.session_state.vector_store_id]}},
-            )
-            st.session_state.assistant = assistant.id
-            return assistant.id
-        except Exception as e:
-            st.error(f"Failed to create assistant: {str(e)}")
-            return None
-
-    def create_thread(self) -> str:
-        """Creates a new thread or reuses an existing one."""
-        if st.session_state.thread_id:
-            return st.session_state.thread_id
-
-        try:
-            thread = self.client.beta.threads.create()
-            st.session_state.thread_id = thread.id
-            return thread.id
-        except Exception as e:
-            st.error(f"Failed to create thread: {str(e)}")
-            return None
-
-    def add_user_message(self, thread_id: str, content: str) -> None:
-        """Adds a user message to the thread."""
-        try:
-            # Save user message to session state first
-            st.session_state.messages.append({"role": "user", "content": content})
-
-            self.client.beta.threads.messages.create(
-                thread_id=thread_id, role="user", content=content
-            )
-        except Exception as e:
-            st.error(f"Failed to add user message: {str(e)}")
-
-    def get_assistant_response(self, thread_id: str) -> Dict:
-        """Retrieves the assistant's latest response from the thread."""
-        if not st.session_state.assistant:
-            self.create_assistant()
-            if not st.session_state.assistant:
-                return {"error": "Assistant not available."}
-
-        try:
-            run = self.client.beta.threads.runs.create(
-                thread_id=thread_id, assistant_id=st.session_state.assistant
-            )
-            # Poll for run completion
-            while run.status not in ["completed", "failed"]:
-                time.sleep(1)
-                run = self.client.beta.threads.runs.retrieve(
-                    thread_id=thread_id, run_id=run.id
-                )
-
-            if run.status == "completed":
-                # Retrieve all messages in the thread
-                messages = self.client.beta.threads.messages.list(thread_id=thread_id)
-                # Filter to get only the most recent assistant message
-                latest_response = None
-                for message in reversed(messages.data):
-                    if message.role == "assistant":
-                        # Check if we've already processed this message
-                        if st.session_state.get("last_message_id") != message.id:
-                            latest_response = message.content[0].text.value
-                            st.session_state["last_message_id"] = message.id  # Update last message ID
-                            break
-
-                if latest_response:
-                    # Save the assistant's new response to session state
-                    st.session_state.messages.append(
-                        {"role": "assistant", "content": latest_response}
-                    )
-                    return {"answer": latest_response}
-                else:
-                    return {"error": "No new assistant response found."}
-            else:
-                return {"error": f"Assistant run failed: {run.status}"}
-        except Exception as e:
-            return {"error": str(e)}  # Return the error message for display
-
-# Helper functions for UI and bot interaction
-def handle_file_upload(bot):
-    """Handles the file upload process and vector store creation."""
-    uploaded_files = st.sidebar.file_uploader(
-        "Upload HR documents",
-        type=["pdf", "txt", "doc", "docx"],
-        accept_multiple_files=True,
-    )
-    if uploaded_files:
-        file_paths = []
-        for file in uploaded_files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file.name) as tmp_file:
-                tmp_file.write(file.getvalue())
-                file_paths.append(tmp_file.name)
-
-        with st.spinner("Uploading documents..."):
-            if not st.session_state.vector_store_id:
-                bot.create_vector_store()
-            if bot.upload_files_to_vector_store(file_paths):
-                st.success("Files uploaded and vector store created successfully.")
-            else:
-                st.error("Failed to upload files to vector store.")
-
-def display_chat_history():
-    """Displays the chat history between user and assistant."""
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-def main():
-    st.set_page_config(
-        page_title="HR Knowledge Base Assistant",
-        page_icon="📚",
-        layout="wide",
-    )
-    st.title("📚 HR Knowledge Base Assistant")
-
-    # Initialize bot
-    bot = RAGBot()
-
-    # Document upload section
-    with st.sidebar:
-        st.header("📁 Document Upload")
-        handle_file_upload(bot)
-        st.divider()
-        st.markdown(
-            """
-            ### Instructions:
-            1. Upload HR documents
-            2. Ask questions about the documents
-            3. See answers
-            """
+        app.state.metrics.bot = Bot(
+            api_key=str(openai_key),
+            assistant_id=str(assistant_id)
         )
+        yield
+    except Exception as e:
+        logger.error(f"Startup error: {str(e)}")
+        raise
+    finally:
+        # Shutdown
+        logger.info("Shutting down...")
+        if hasattr(app.state.metrics, 'bot') and app.state.metrics.bot:
+            await app.state.metrics.bot.cleanup()
 
-    # Chat input
-    prompt = st.chat_input("Ask about your HR documents")
-    if prompt:
-        # Input validation
-        if prompt.strip() == "":
-            st.error("Please enter a valid question.")
-        else:
-            # Create or reuse a thread
-            thread_id = bot.create_thread()
-            if thread_id:
-                bot.add_user_message(thread_id, prompt)
-                with st.spinner("Assistant is typing..."):
-                    response = bot.get_assistant_response(thread_id)
-                    if "error" in response:
-                        st.error(response["error"])
-            else:
-                st.error("Failed to create or retrieve thread.")
+# Initialize FastAPI with lifecycle management
+app = FastAPI(
+    title="HR Assistant Bot",
+    description="Slack bot for HR assistance using OpenAI",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
-    # Display existing messages in the chat history
-    display_chat_history()
+# Add middlewares
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("ALLOWED_ORIGINS", "*")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize Slack app
+slack_app = AsyncApp(token=bot_token, signing_secret=signing_secret)
+handler = AsyncSlackRequestHandler(slack_app)
+
+def get_confidence_emoji(confidence: str) -> str:
+    """Get emoji indicator for confidence level."""
+    return {
+        "high": "🟢",
+        "medium": "🟡",
+        "low": "🔴"
+    }.get(confidence.lower(), "❓")
+
+def format_response_blocks(response_data: Dict[str, Any]) -> list:
+    """Format JSON response into Slack blocks with error handling."""
+    try:
+        response = response_data.get("response", {})
+        metadata = response_data.get("metadata", {})
+        blocks = []
+
+        # Processing time and metadata
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": (f"⏱️ Processed in {response.get('processing_time', 'N/A')}s | "
+                        f"🌐 Lang: {metadata.get('language', 'unknown')}")
+            }]
+        })
+
+        # Confidence indicator
+        confidence = response.get("confidence", "low")
+        blocks.append({
+            "type": "context",
+            "elements": [{
+                "type": "mrkdwn",
+                "text": f"{get_confidence_emoji(confidence)} Confidence: {confidence.upper()}"
+            }]
+        })
+
+        # Main answer
+        answer = response.get("answer", "No answer provided")
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": answer
+            }
+        })
+
+        # Sources
+        sources = response.get("sources", [])
+        if sources:
+            blocks.append({"type": "divider"})
+            source_text = "*Sources:*\n" + "\n".join([f"• {source}" for source in sources])
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": source_text
+                }]
+            })
+
+        return blocks
+    except Exception as e:
+        logger.error(f"Error formatting response: {str(e)}", exc_info=True)
+        return [{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Error formatting response. Please try again."
+            }
+        }]
+
+@slack_app.event("message")
+async def handle_message(event, say):
+    """Handle incoming DM messages with proper type checking."""
+    logger.info(f"Received message event type: {event.get('type')}")
+
+    try:
+        # Message validation with type checking
+        channel_id: str = str(event.get("channel", ""))
+        user_id: str = str(event.get("user", ""))
+
+        if not channel_id or not user_id:
+            logger.error("Missing channel_id or user_id")
+            return
+
+        # Various checks
+        if any([
+            event.get("subtype") is not None,
+            event.get("thread_ts") is not None,
+            event.get("channel_type") != "im"
+        ]):
+            return
+
+        # Send typing indicator
+        try:
+            await say({
+                "channel": channel_id,
+                "text": "Processing your request...",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "🤔 Processing your request..."
+                    }
+                }]
+            })
+        except Exception as e:
+            logger.error(f"Failed to send typing indicator: {str(e)}")
+            return
+
+        # Get response from bot
+        if not app.state.metrics.bot:
+            raise ValueError("Bot not initialized")
+
+        start_time = time.time()
+        response = await app.state.metrics.bot.get_answer(event.get("text", "").strip())
+        processing_time = time.time() - start_time
+
+        # Add processing time if not present
+        if "response" in response:
+            response["response"]["processing_time"] = processing_time
+
+        blocks = format_response_blocks(response)
+
+        # Send response
+        await say({
+            "channel": channel_id,
+            "text": response.get("response", {}).get("answer", "Processing your request..."),
+            "blocks": blocks
+        })
+
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
+        error_block = [{
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "Sorry, I encountered an error. Please try again later."
+            }
+        }]
+
+        if channel_id:
+            try:
+                await say({
+                    "channel": channel_id,
+                    "text": "Error processing request",
+                    "blocks": error_block
+                })
+            except Exception as e2:
+                logger.error(f"Failed to send error message: {str(e2)}")
+
+@app.get("/health")
+async def health_check():
+    """Enhanced health check endpoint with metrics."""
+    uptime = time.time() - app.state.metrics.start_time
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "environment": os.getenv("ENVIRONMENT", "production"),
+        "metrics": {
+            "uptime_seconds": uptime,
+            "request_count": app.state.metrics.request_count,
+            "error_count": app.state.metrics.error_count,
+            "error_rate": (app.state.metrics.error_count / app.state.metrics.request_count
+                          if app.state.metrics.request_count > 0 else 0),
+            "last_error": app.state.metrics.last_error
+        }
+    }
+
+@app.post("/slack/events")
+async def endpoint(request: Request):
+    """Slack events endpoint with enhanced error handling."""
+    try:
+        body = await request.json()
+        if body.get("type") == "url_verification":
+            logger.info("Handling Slack URL verification challenge")
+            return {"challenge": body.get("challenge")}
+
+        logger.info(f"Processing slack event type: {body.get('type')}")
+        return await handler.handle(request)
+    except Exception as e:
+        logger.error(f"Error processing slack event: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": str(exc.detail)}
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions."""
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(
+        app,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", 8000)),
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
+        reload=os.getenv("ENVIRONMENT") == "development"
+    )

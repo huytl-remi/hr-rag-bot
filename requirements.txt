@@ -1,1 +1,6 @@
+slack-bolt
+fastapi
+uvicorn
+python-dotenv
 openai
+tenacity
