@@ -4,3 +4,4 @@ uvicorn
 python-dotenv
 openai
 tenacity
+aiohttp
