@@ -261,16 +261,20 @@ class Bot:
                     role="user",
                     content=f"""Query: {query}
 
-                    Detect the language and respond EXACTLY in this JSON format:
+                    Be truthful. When you don't know, say so. When sources don't exist, acknowledge it in your response.
+
+                    Detect the query's language and answer in that language.
+
+                    Respond in this JSON format:
                     ```json
                     {{
                         "metadata": {{
-                            "language": "en"
+                            "language": "en"  // detected query language
                         }},
                         "response": {{
-                            "answer": "your answer in the SAME language as the query",
-                            "sources": ["source1", "source2"],
-                            "confidence": "high|medium|low"
+                            "answer": "your response in query's language",
+                            "sources": ["only include REAL sources you're certain about"],
+                            "confidence": "high|medium|low"  // your confidence in the completeness and accuracy
                         }}
                     }}
                     ```"""
